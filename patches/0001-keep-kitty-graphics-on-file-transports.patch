@@ -1,0 +1,585 @@
+From 72c4467083f62e67c1bf028a81df22c4ea994312 Mon Sep 17 00:00:00 2001
+From: Damien Fleminks <damien@fleminks.com>
+Date: Thu, 29 Oct 2026 10:12:58 +0100
+Subject: [PATCH] fix: keep kitty graphics on file transports with local
+ ghostty
+
+- macos: write client t=t files under the per-user temporary directory;
+  ghostty resolves /tmp to /private/tmp and rejects it, so every image
+  went inline as base64
+- a server-retired transfer (placement moved or surface went inactive
+  while a file was in flight) now pauses file transfers for one second
+  instead of disabling them until the client reconnects; the client no
+  longer disables its side on retirement either
+- allow decoded file exports up to 64 MiB so full panes on high-density
+  displays can use the file route
+- let one image that exceeds the inline budget into the scene when the
+  client can take files, instead of dropping it silently
+- fingerprint image payloads with foldhash instead of siphash
+---
+ Cargo.lock                                   |  1 +
+ crates/ghostty-vt/Cargo.toml                 |  1 +
+ crates/ghostty-vt/src/lib.rs                 |  7 +--
+ crates/ghostty-vt/src/pane_graphics_files.rs | 11 +++--
+ src/client/state.rs                          |  6 +--
+ src/kitty_graphics/surface.rs                | 16 +++++++
+ src/platform/fallback.rs                     |  5 +++
+ src/platform/linux.rs                        |  4 ++
+ src/platform/macos.rs                        | 36 +++++++++++++++
+ src/platform/unix_image_files.rs             |  8 ++--
+ src/server/client_shell.rs                   |  2 +
+ src/server/client_shell_graphics.rs          |  4 ++
+ src/server/headless/native_graphics.rs       | 47 +++++++++++++++++---
+ src/server/headless/render.rs                |  2 +
+ src/server/headless/retained_surface.rs      |  1 +
+ src/server/headless/tests/native_graphics.rs | 18 ++++++++
+ src/server/render_scale_benchmark.rs         |  3 ++
+ 17 files changed, 150 insertions(+), 22 deletions(-)
+
+diff --git a/Cargo.lock b/Cargo.lock
+index 9357a151..04ee0681 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -745,6 +745,7 @@ name = "ghostty-vt"
+ version = "0.0.0"
+ dependencies = [
+  "base64",
++ "foldhash 0.1.5",
+  "libc",
+  "png",
+  "tracing",
+diff --git a/crates/ghostty-vt/Cargo.toml b/crates/ghostty-vt/Cargo.toml
+index 53c44fda..930eaee5 100644
+--- a/crates/ghostty-vt/Cargo.toml
++++ b/crates/ghostty-vt/Cargo.toml
+@@ -9,6 +9,7 @@ publish = false
+ 
+ [dependencies]
+ base64 = "0.22.1"
++foldhash = "0.1"
+ libc = "0.2"
+ png = "0.17"
+ tracing = "0.1.44"
+diff --git a/crates/ghostty-vt/src/lib.rs b/crates/ghostty-vt/src/lib.rs
+index 4bf36754..26acdfb3 100644
+--- a/crates/ghostty-vt/src/lib.rs
++++ b/crates/ghostty-vt/src/lib.rs
+@@ -15,7 +15,7 @@ use std::collections::hash_map::DefaultHasher;
+ use std::collections::HashMap;
+ use std::ffi::c_void;
+ use std::fmt;
+-use std::hash::{Hash, Hasher};
++use std::hash::{BuildHasher, Hash, Hasher};
+ use std::marker::PhantomData;
+ use std::mem;
+ use std::ops::RangeInclusive;
+@@ -2835,7 +2835,8 @@ fn kitty_image_data_from_ptr(ptr_out: *const u8, len: usize) -> Vec<u8> {
+ }
+ 
+ // Hashes the full payload. Callers cache the result per image id and only
+-// recompute it when the image's transmit time changes.
++// recompute it when the image's transmit time changes. Frames can be tens of
++// MiB many times a second, so this uses a fast hasher rather than SipHash.
+ fn kitty_image_fingerprint(
+     ptr_out: *const u8,
+     len: usize,
+@@ -2843,7 +2844,7 @@ fn kitty_image_fingerprint(
+     image_height: u32,
+     format: KittyImageFormat,
+ ) -> u64 {
+-    let mut hasher = DefaultHasher::new();
++    let mut hasher = foldhash::quality::FixedState::default().build_hasher();
+     len.hash(&mut hasher);
+     image_width.hash(&mut hasher);
+     image_height.hash(&mut hasher);
+diff --git a/crates/ghostty-vt/src/pane_graphics_files.rs b/crates/ghostty-vt/src/pane_graphics_files.rs
+index c5f844d2..cdc2ea49 100644
+--- a/crates/ghostty-vt/src/pane_graphics_files.rs
++++ b/crates/ghostty-vt/src/pane_graphics_files.rs
+@@ -98,6 +98,9 @@ impl Drop for Reservation {
+ }
+ 
+ const MAX_EXPORT_BYTES: usize = 16 * 1024 * 1024;
++/// Decoded images the server writes for a local client. Larger than snapshots
++/// because a full-pane frame on a high-density display easily exceeds 16 MiB.
++pub const MAX_DECODED_EXPORT_BYTES: usize = 64 * 1024 * 1024;
+ 
+ #[derive(Debug)]
+ struct Lease {
+@@ -189,10 +192,10 @@ impl FileStore {
+     /// Snapshot decoded bytes into a private, uniquely named file. Aggregate
+     /// outstanding-export limits are the caller's responsibility.
+     pub fn export(&self, data: &[u8]) -> io::Result<OwnedExport> {
+-        if data.len() > MAX_EXPORT_BYTES {
++        if data.len() > MAX_DECODED_EXPORT_BYTES {
+             return Err(io::Error::new(
+                 io::ErrorKind::InvalidInput,
+-                "decoded export exceeds 16 MiB",
++                "decoded export exceeds 64 MiB",
+             ));
+         }
+         let reservation = self
+@@ -853,7 +856,9 @@ mod tests {
+     #[test]
+     fn decoded_export_rejects_oversize_and_never_overwrites_collisions() {
+         let (store, base) = store();
+-        assert!(store.export(&vec![0; MAX_EXPORT_BYTES + 1]).is_err());
++        assert!(store
++            .export(&vec![0; MAX_DECODED_EXPORT_BYTES + 1])
++            .is_err());
+         assert!(!store.is_initialized());
+         let collision = frame(&store, "decoded-1.rgba", &[7, 8]);
+         assert!(store.export(&[1, 2, 3, 4]).is_err());
+diff --git a/src/client/state.rs b/src/client/state.rs
+index 312c65ca..f98114d4 100644
+--- a/src/client/state.rs
++++ b/src/client/state.rs
+@@ -239,10 +239,8 @@ impl ClientState {
+         image_id: u32,
+         owner_active: bool,
+     ) {
+-        if transfer_id & crate::kitty_graphics::surface::NATIVE_TRANSFER_BIT != 0 {
+-            self.disabled_native_graphics
+-                .insert(endpoint_id.clone(), generation);
+-        }
++        // The server decides when file transfers stop for good. A retirement only
++        // cancels this transfer; its tombstone below rejects the stale file.
+         self.record_retired_direct_graphics(endpoint_id.clone(), generation, transfer_id, image_id);
+         let upload_pending = self
+             .pending_surface_graphics
+diff --git a/src/kitty_graphics/surface.rs b/src/kitty_graphics/surface.rs
+index 09db2286..d15f4fe4 100644
+--- a/src/kitty_graphics/surface.rs
++++ b/src/kitty_graphics/surface.rs
+@@ -579,6 +579,7 @@ pub(crate) fn collect_scene(
+     cell_size: HostCellSize,
+     delivered: &DeliveryCache,
+     _client_id: u64,
++    files_available: bool,
+ ) -> (SurfaceGraphicsScene, DeliveryCache, SourceFiles) {
+     if !cell_size.is_known() {
+         return (
+@@ -753,6 +754,7 @@ pub(crate) fn collect_scene(
+     let mut available = asset_data.into_iter().collect::<Vec<_>>();
+     available.sort_by_key(|(key, _)| format!("{:?}", key.source));
+     let mut payload_bytes = 0usize;
++    let mut oversized_file_slot = files_available;
+     for (key, data) in available {
+         if next.assets.contains(&key) {
+             continue;
+@@ -761,6 +763,20 @@ pub(crate) fn collect_scene(
+             usize::try_from(key.data_len).unwrap_or(usize::MAX),
+         );
+         if encoded_size > super::HEADLESS_GRAPHICS_TRANSACTION_BUDGET {
++            // Too large to send inline, but one such image can still reach the
++            // client as a file. If it ends up inline anyway, the render trims it.
++            if oversized_file_slot
++                && matches!(key.source, SurfaceGraphicsSource::Terminal { .. })
++                && key.format == SurfaceGraphicsFormat::Rgba
++                && key.data_len <= crate::pane_graphics_files::MAX_DECODED_EXPORT_BYTES as u64
++            {
++                oversized_file_slot = false;
++                assets.push(SurfaceGraphicsAsset {
++                    key: key.clone(),
++                    data,
++                });
++                next.assets.insert(key);
++            }
+             continue;
+         }
+         if payload_bytes.saturating_add(encoded_size) > super::HEADLESS_GRAPHICS_TRANSACTION_BUDGET
+diff --git a/src/platform/fallback.rs b/src/platform/fallback.rs
+index 2dc7772f..04e1551a 100644
+--- a/src/platform/fallback.rs
++++ b/src/platform/fallback.rs
+@@ -133,6 +133,11 @@ pub(crate) fn should_draw_host_cursor_by_default() -> bool {
+     false
+ }
+ 
++#[cfg(unix)]
++pub(crate) fn kitty_temporary_file_root() -> PathBuf {
++    PathBuf::from("/tmp")
++}
++
+ pub(crate) fn should_query_host_terminal_palette() -> bool {
+     false
+ }
+diff --git a/src/platform/linux.rs b/src/platform/linux.rs
+index ea9b13dd..60fa0972 100644
+--- a/src/platform/linux.rs
++++ b/src/platform/linux.rs
+@@ -244,6 +244,10 @@ pub(crate) fn should_draw_host_cursor_by_default() -> bool {
+     running_inside_wsl()
+ }
+ 
++pub(crate) fn kitty_temporary_file_root() -> PathBuf {
++    PathBuf::from("/tmp")
++}
++
+ pub(crate) fn should_query_host_terminal_palette() -> bool {
+     !running_inside_wsl()
+ }
+diff --git a/src/platform/macos.rs b/src/platform/macos.rs
+index 484ed1cb..b79c4444 100644
+--- a/src/platform/macos.rs
++++ b/src/platform/macos.rs
+@@ -376,6 +376,32 @@ pub(crate) fn switch_to_ascii_input_source() -> Option<InputSourceRestore> {
+     Some(InputSourceRestore { previous: current })
+ }
+ 
++/// Ghostty reads Kitty `t=t` files only from a temporary directory and checks the
++/// file's resolved path, so `/tmp` (really `/private/tmp`) never qualifies on macOS.
++/// The per-user temporary directory is what macOS hands GUI terminals as `TMPDIR`.
++pub(crate) fn kitty_temporary_file_root() -> PathBuf {
++    darwin_user_temporary_directory().unwrap_or_else(|| PathBuf::from("/tmp"))
++}
++
++fn darwin_user_temporary_directory() -> Option<PathBuf> {
++    let mut buffer = vec![0u8; libc::PATH_MAX as usize];
++    // SAFETY: the buffer is writable for the length passed, and confstr writes at most
++    // that many bytes including the terminating NUL.
++    let needed = unsafe {
++        libc::confstr(
++            libc::_CS_DARWIN_USER_TEMP_DIR,
++            buffer.as_mut_ptr().cast(),
++            buffer.len(),
++        )
++    };
++    if needed == 0 || needed > buffer.len() {
++        return None;
++    }
++    buffer.truncate(needed - 1);
++    let path = PathBuf::from(OsStr::from_bytes(&buffer));
++    path.is_absolute().then_some(path)
++}
++
+ pub fn raise_server_nofile_limit() {
+     match raise_nofile_limit(SERVER_NOFILE_LIMIT_TARGET) {
+         Ok(None) => {}
+@@ -1205,6 +1231,16 @@ pub fn process_exists(pid: u32) -> bool {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn kitty_temporary_files_use_the_per_user_temporary_directory() {
++        let root = kitty_temporary_file_root();
++        assert!(root.is_dir(), "{root:?}");
++        assert!(
++            !root.canonicalize().unwrap().starts_with("/private/tmp"),
++            "{root:?}"
++        );
++    }
++
+     #[test]
+     fn nofile_target_raises_low_soft_limit_to_cap_when_hard_is_unlimited() {
+         assert_eq!(
+diff --git a/src/platform/unix_image_files.rs b/src/platform/unix_image_files.rs
+index 795d4b10..b3b67f15 100644
+--- a/src/platform/unix_image_files.rs
++++ b/src/platform/unix_image_files.rs
+@@ -49,11 +49,9 @@ impl Ledger {
+     pub(crate) fn new() -> Self {
+         Self {
+             // Do not use TMPDIR/XDG_RUNTIME_DIR: a client override need not
+-            // be in the terminal's accepted temporary-file roots. /tmp is
+-            // explicitly accepted by Ghostty graphics_image.zig in v1.1.3,
+-            // v1.2.3 and main, independent of its TMPDIR. /var/tmp is NOT
+-            // generally accepted, so this bounded ledger must use /tmp.
+-            root: PathBuf::from("/tmp"),
++            // be in the terminal's accepted temporary-file roots. The platform
++            // picks a root Ghostty accepts independent of the client's TMPDIR.
++            root: super::kitty_temporary_file_root(),
+             directory: None,
+             pending: Vec::new(),
+             next: 0,
+diff --git a/src/server/client_shell.rs b/src/server/client_shell.rs
+index 0a98da09..31daf309 100644
+--- a/src/server/client_shell.rs
++++ b/src/server/client_shell.rs
+@@ -292,6 +292,7 @@ pub(super) fn render_pane_surface(
+     cell_size: crate::kitty_graphics::HostCellSize,
+     graphics_delivery: &crate::kitty_graphics::surface::DeliveryCache,
+     client_id: u64,
++    files_available: bool,
+ ) -> Result<RenderedPaneSurface, SurfaceRenderDeferred> {
+     let layout = crate::ui::compute_tab_surface_for(
+         &app.state,
+@@ -449,6 +450,7 @@ pub(super) fn render_pane_surface(
+             cell_size,
+             graphics_delivery,
+             client_id,
++            files_available,
+         );
+     if let Some(target) = target {
+         for (&pane_id, &(epoch, _)) in &content_revisions_before {
+diff --git a/src/server/client_shell_graphics.rs b/src/server/client_shell_graphics.rs
+index 8499b964..645b2a20 100644
+--- a/src/server/client_shell_graphics.rs
++++ b/src/server/client_shell_graphics.rs
+@@ -8,6 +8,7 @@ pub(crate) fn collect_retained(
+     cell_size: crate::kitty_graphics::HostCellSize,
+     delivered: &DeliveryCache,
+     client_id: u64,
++    files_available: bool,
+ ) -> Option<(SurfaceGraphicsScene, DeliveryCache, SourceFiles)> {
+     let rect = |rect: crate::protocol::SurfaceRect| {
+         ratatui::layout::Rect::new(rect.x, rect.y, rect.width, rect.height)
+@@ -39,6 +40,7 @@ pub(crate) fn collect_retained(
+         cell_size,
+         delivered,
+         client_id,
++        files_available,
+     ))
+ }
+ 
+@@ -51,6 +53,7 @@ pub(crate) fn collect(
+     cell_size: crate::kitty_graphics::HostCellSize,
+     delivered: &DeliveryCache,
+     client_id: u64,
++    files_available: bool,
+ ) -> (SurfaceGraphicsScene, DeliveryCache, SourceFiles) {
+     let popup_content_size = popup.map(|popup| (popup.frame.width, popup.frame.height));
+     crate::kitty_graphics::surface::collect_scene(
+@@ -64,5 +67,6 @@ pub(crate) fn collect(
+         cell_size,
+         delivered,
+         client_id,
++        files_available,
+     )
+ }
+diff --git a/src/server/headless/native_graphics.rs b/src/server/headless/native_graphics.rs
+index 67417d38..b54e2914 100644
+--- a/src/server/headless/native_graphics.rs
++++ b/src/server/headless/native_graphics.rs
+@@ -11,10 +11,13 @@ use std::sync::Arc;
+ use std::time::{Duration, Instant};
+ 
+ use crate::kitty_graphics::surface::NATIVE_TRANSFER_BIT as NATIVE_BIT;
+-const MAX_FILE: usize = 16 * 1024 * 1024;
+-const MAX_BYTES: usize = 64 * 1024 * 1024;
++const MAX_FILE: usize = crate::pane_graphics_files::MAX_DECODED_EXPORT_BYTES;
++const MAX_BYTES: usize = 2 * MAX_FILE;
+ const DELIVERY_TIMEOUT: Duration = Duration::from_secs(5);
+ const RESPONSE_TIMEOUT: Duration = Duration::from_secs(3);
++// After the server retires a transfer, the recovery render goes inline; file
++// transfers resume once this has passed.
++const RETIREMENT_COOLDOWN: Duration = Duration::from_secs(1);
+ 
+ pub(super) struct Pending {
+     export: Arc<OwnedExport>,
+@@ -25,6 +28,8 @@ pub(super) struct Pending {
+     slot: bool,
+     deadline: Instant,
+     written: bool,
++    // Retired by the server because the scene moved on, not because the client failed.
++    retired: bool,
+     refresh_needed: bool,
+     scene: SurfaceGraphicsScene,
+     delivery: DeliveryCache,
+@@ -46,6 +51,7 @@ pub(super) struct NativeGraphics {
+     store: FileStore,
+     pending: HashMap<u64, Pending>,
+     disabled: HashSet<u64>,
++    cooling_down: HashMap<u64, Instant>,
+     next_transfer: u64,
+     source_retries: HashMap<u64, Instant>,
+     // The key and bank currently addressed for each logical source. Native state
+@@ -58,6 +64,7 @@ impl Default for NativeGraphics {
+             store: FileStore::default(),
+             pending: HashMap::new(),
+             disabled: HashSet::new(),
++            cooling_down: HashMap::new(),
+             next_transfer: 1,
+             source_retries: HashMap::new(),
+             acknowledged_slots: HashMap::new(),
+@@ -69,9 +76,18 @@ impl NativeGraphics {
+     pub(super) fn busy(&self) -> bool {
+         !self.pending.is_empty()
+     }
++    #[cfg(all(test, unix))]
++    pub(super) fn end_cooldown_for_test(&mut self, client: u64) {
++        self.cooling_down.insert(client, Instant::now());
++    }
+     pub(super) fn is_pending(&self, client: u64) -> bool {
+         self.pending.contains_key(&client)
+     }
++    fn cooling_down(&self, client: u64) -> bool {
++        self.cooling_down
++            .get(&client)
++            .is_some_and(|until| *until > Instant::now())
++    }
+     pub(super) fn can_hold(&self, client: u64, scene: &SurfaceGraphicsScene) -> bool {
+         let Some(pending) = self.pending.get(&client) else {
+             return true;
+@@ -174,6 +190,7 @@ impl NativeGraphics {
+         sources: &mut SourceFiles,
+     ) -> Option<(Pending, ServerMessage)> {
+         if self.disabled.contains(&client)
++            || self.cooling_down(client)
+             || self.pending.contains_key(&client)
+             || self.pending.len() >= 8
+         {
+@@ -237,6 +254,7 @@ impl NativeGraphics {
+                 slot,
+                 deadline: Instant::now() + DELIVERY_TIMEOUT,
+                 written: false,
++                retired: false,
+                 refresh_needed: delivery.has_pending(),
+                 scene: held,
+                 delivery: delivery.clone(),
+@@ -295,6 +313,12 @@ fn eligible(asset: &SurfaceGraphicsAsset, sources: &SourceFiles) -> bool {
+             == Some(asset.key.data_len)
+ }
+ impl HeadlessServer {
++    /// Whether the next render may hand this client an image as a file.
++    pub(super) fn native_files_available(&self, client: u64) -> bool {
++        self.client_supports_direct_graphics(client)
++            && !self.native_graphics.disabled.contains(&client)
++            && !self.native_graphics.cooling_down(client)
++    }
+     pub(super) fn defer_changed_native_geometry(
+         &mut self,
+         client: u64,
+@@ -440,7 +464,7 @@ impl HeadlessServer {
+             .pending
+             .iter()
+             .filter(|(_, p)| p.deadline <= now)
+-            .map(|(id, p)| (*id, p.transfer_id, p.image_id))
++            .map(|(id, p)| (*id, p.transfer_id, p.image_id, p.retired))
+             .collect();
+         let mut changed = false;
+         self.native_graphics.source_retries.retain(|id, deadline| {
+@@ -453,8 +477,14 @@ impl HeadlessServer {
+             }
+             false
+         });
+-        for (id, transfer_id, image_id) in expired {
+-            self.native_graphics.disabled.insert(id);
++        for (id, transfer_id, image_id, retired) in expired {
++            if retired {
++                self.native_graphics
++                    .cooling_down
++                    .insert(id, now + RETIREMENT_COOLDOWN);
++            } else {
++                self.native_graphics.disabled.insert(id);
++            }
+             let message = ServerMessage::GraphicsTransmissionRetired {
+                 transfer_id,
+                 image_id,
+@@ -466,7 +496,9 @@ impl HeadlessServer {
+                 continue;
+             } // Keep the export alive until retirement is queued or disconnect cleans it.
+             self.native_graphics.pending.remove(&id);
+-            self.native_graphics.disabled.insert(id);
++            if !retired {
++                self.native_graphics.disabled.insert(id);
++            }
+             if let Some(c) = self.clients.get_mut(&id) {
+                 c.shell_graphics_delivery = DeliveryCache::default();
+                 c.defer_full_render();
+@@ -478,7 +510,7 @@ impl HeadlessServer {
+     pub(super) fn retire_native_graphics_for_client(&mut self, id: u64) {
+         if let Some(p) = self.native_graphics.pending.get_mut(&id) {
+             p.deadline = Instant::now();
+-            self.native_graphics.disabled.insert(id);
++            p.retired = true;
+             if self.expire_native_graphics(Instant::now()) {
+                 self.app.render_dirty.request_generic();
+             }
+@@ -487,6 +519,7 @@ impl HeadlessServer {
+     pub(super) fn disconnect_native_graphics(&mut self, id: u64) {
+         self.native_graphics.pending.remove(&id);
+         self.native_graphics.disabled.remove(&id);
++        self.native_graphics.cooling_down.remove(&id);
+         self.native_graphics.source_retries.remove(&id);
+         self.native_graphics.acknowledged_slots.remove(&id);
+     }
+diff --git a/src/server/headless/render.rs b/src/server/headless/render.rs
+index aa075a95..59605be4 100644
+--- a/src/server/headless/render.rs
++++ b/src/server/headless/render.rs
+@@ -578,6 +578,7 @@ impl HeadlessServer {
+                 .get(&client_id)
+                 .map(|client| client.shell_graphics_delivery.clone())
+                 .unwrap_or_default();
++            let shell_files_available = self.native_files_available(client_id);
+             let shell_render = if matches!(mode, ClientConnectionMode::ClientShell)
+                 && self
+                     .clients
+@@ -599,6 +600,7 @@ impl HeadlessServer {
+                     render_cell_size,
+                     &shell_graphics_delivery,
+                     client_id,
++                    shell_files_available,
+                 );
+                 crate::render_prof::duration_since(
+                     "full_render.render_tab_surface_virtual",
+diff --git a/src/server/headless/retained_surface.rs b/src/server/headless/retained_surface.rs
+index 2a98536f..a4e40481 100644
+--- a/src/server/headless/retained_surface.rs
++++ b/src/server/headless/retained_surface.rs
+@@ -453,6 +453,7 @@ impl HeadlessServer {
+                         client.cell_size,
+                         &client.shell_graphics_delivery,
+                         client_id,
++                        self.native_files_available(client_id),
+                     )
+                 else {
+                     fallback!("graphics_geometry");
+diff --git a/src/server/headless/tests/native_graphics.rs b/src/server/headless/tests/native_graphics.rs
+index bde7cf08..202d394c 100644
+--- a/src/server/headless/tests/native_graphics.rs
++++ b/src/server/headless/tests/native_graphics.rs
+@@ -445,6 +445,24 @@ fn native_timeout_uses_control_lane_and_falls_back_inline() {
+     assert!(!native_result(&mut server, 7, token, image, true));
+ }
+ 
++#[test]
++fn server_retirement_pauses_native_files_and_then_resumes_them() {
++    let mut server = test_headless_server();
++    let (control, _render) = add_client(&mut server, 7);
++    let (path, token, image) = prepare_and_commit(&mut server, 7);
++    server.retire_native_graphics_for_client(7);
++    assert_retirement(&control, token, image);
++    assert!(!path.exists());
++    assert!(!server.native_graphics.is_pending(7));
++    assert_native_disabled(&mut server, 7);
++    assert!(!native_result(&mut server, 7, token, image, true));
++
++    server.native_graphics.end_cooldown_for_test(7);
++    let (resumed, resumed_token, _) = prepare_and_commit(&mut server, 7);
++    assert!(resumed.exists());
++    assert_ne!(resumed_token, token);
++}
++
+ #[test]
+ fn native_rejection_falls_back_without_disabling_other_client() {
+     let mut server = test_headless_server();
+diff --git a/src/server/render_scale_benchmark.rs b/src/server/render_scale_benchmark.rs
+index cba0cbfd..6f98e7c0 100644
+--- a/src/server/render_scale_benchmark.rs
++++ b/src/server/render_scale_benchmark.rs
+@@ -94,6 +94,7 @@ impl RenderPipeline {
+             },
+             &self.graphics_delivery,
+             1,
++            false,
+         )
+         .expect("benchmark surface");
+         let server_elapsed = started.elapsed();
+@@ -496,6 +497,7 @@ fn print_surface_damage_profiles() {
+             HostCellSize::default(),
+             &pipeline.graphics_delivery,
+             1,
++            false,
+         )
+         .expect("benchmark surface");
+         let mut surface = PaneSurfaceFrame {
+@@ -548,6 +550,7 @@ fn print_surface_reuse_profiles() {
+                 HostCellSize::default(),
+                 &pipeline.graphics_delivery,
+                 1,
++                false,
+             )
+             .expect("benchmark surface");
+             let surface = PaneSurfaceFrame {
